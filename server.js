@@ -28,7 +28,11 @@ const port = process.env.PORT || 3012;
 app.use(cors());
 app.use((req, res, next) => {
   const apiKey = req.headers['authorization'];
-  if (!apiKey) return res.status(401).json({ error: 'Unauthorized' });
+  if (!apiKey) {
+    console.log('Unauthorized request:', req.method, req.url);
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  console.log('Authorized request:', req.method, req.url);
   next();
 });
 
@@ -42,12 +46,14 @@ class AudiolibrixProvider {
   }
 
   async searchBooks(query) {
+    console.log('Starting search for query:', query);
     try {
       const response = await axios.get(this.searchUrl, {
         params: { query },
         headers: { 'User-Agent': 'Mozilla/5.0' },
       });
 
+      console.log('Search page fetched, parsing results...');
       const $ = cheerio.load(response.data);
       const matches = [];
 
@@ -57,16 +63,18 @@ class AudiolibrixProvider {
         const url = this.baseUrl + $el.find('h2 a').attr('href');
         const cover = cleanCoverUrl($el.find('picture img').attr('src'));
 
-        if (title && url) matches.push({ title, url, cover });
+        if (title && url) {
+          matches.push({ title, url, cover });
+          console.log(`Found book: ${title}`);
+        }
       });
 
+      console.log(`Found ${matches.length} matches, fetching full metadata...`);
       const limit = pLimit(5); // maximálně 5 současně
-
-const fullMetadata = await Promise.all(
-  matches.map(m =>
-    limit(() => this.getFullMetadata(m))
-  )
-);
+      const fullMetadata = await Promise.all(
+        matches.map(m => limit(() => this.getFullMetadata(m)))
+      );
+      console.log('All metadata fetched');
       return fullMetadata;
     } catch (err) {
       console.error('Search error:', err.message);
@@ -75,6 +83,7 @@ const fullMetadata = await Promise.all(
   }
 
   async getFullMetadata(match) {
+    console.log('Fetching metadata for:', match.title);
     try {
       const response = await axios.get(match.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
       const $ = cheerio.load(response.data);
@@ -82,7 +91,7 @@ const fullMetadata = await Promise.all(
       // ---------------- Subtitle ----------------
       const subtitle = $('p.lead.mt-3').first().text().trim();
 
-	  // ---------------- Description from Anotace ----------------
+      // ---------------- Description ----------------
       let description = '';
       $('article.alx-card-clean').each((i, el) => {
         const header = $(el).find('h2.card-title').text().trim();
@@ -98,14 +107,10 @@ const fullMetadata = await Promise.all(
 
       // ---------------- Publisher & Language ----------------
       let publisher = $('dt:contains("Vydavatel")').next('dd').find('a').first().text().trim();
-	  let publishedYear = '';
-
-const publisherText = $('dt:contains("Vydavatel")').next('dd').text();
-const yearMatch = publisherText.match(/\((\d{4})\)/);
-
-if (yearMatch) {
-  publishedYear = yearMatch[1];
-}
+      let publishedYear = '';
+      const publisherText = $('dt:contains("Vydavatel")').next('dd').text();
+      const yearMatch = publisherText.match(/\((\d{4})\)/);
+      if (yearMatch) publishedYear = yearMatch[1];
       const language = $('dt:contains("Jazyk")').next('dd').text().trim();
 
       // ---------------- Genres ----------------
@@ -126,39 +131,40 @@ if (yearMatch) {
         .get()
         .filter(Boolean);
 
-// ---------------- Authors / Autoři ----------------
+      // ---------------- Authors ----------------
       let authors = [];
       $('dt').each((i, el) => {
         const text = $(el).text().trim();
         if (text === 'Autor:' || text === 'Autoři:') {
           authors = $(el).next('dd').find('a')
-            .not('.d-block.small.alx-collapse-exit') // vynecháme odkaz "další interpreti"
-            .map((i, el) => $(el).text().trim())
-            .get()
-            .filter(Boolean);
-        }
-      });
-      
-	  // ---------------- Narrators / Interpreti ----------------
-      let narrators = [];
-      $('dt').each((i, el) => {
-        const text = $(el).text().trim();
-        if (text === 'Interpret:' || text === 'Interpreti:') {
-          narrators = $(el).next('dd').find('a')
-            .not('.d-block.small.alx-collapse-exit') // vynecháme odkaz "další interpreti"
+            .not('.d-block.small.alx-collapse-exit')
             .map((i, el) => $(el).text().trim())
             .get()
             .filter(Boolean);
         }
       });
 
+      // ---------------- Narrators ----------------
+      let narrators = [];
+      $('dt').each((i, el) => {
+        const text = $(el).text().trim();
+        if (text === 'Interpret:' || text === 'Interpreti:') {
+          narrators = $(el).next('dd').find('a')
+            .not('.d-block.small.alx-collapse-exit')
+            .map((i, el) => $(el).text().trim())
+            .get()
+            .filter(Boolean);
+        }
+      });
+
+      console.log(`Metadata fetched for: ${match.title}`);
       return {
         title: match.title || '',
-		subtitle: subtitle || '',
+        subtitle: subtitle || '',
         author: authors,
         narrator: narrators,
         publisher: publisher || '',
-		publishedYear: publishedYear || '',
+        publishedYear: publishedYear || '',
         description: description || '',
         cover: match.cover || '',
         genres: genres,
@@ -170,11 +176,11 @@ if (yearMatch) {
       console.error('Metadata fetch error for', match.title, err.message);
       return {
         title: match.title || '',
-		subtitle: subtitle || '',
+        subtitle: '',
         author: [],
         narrator: [],
         publisher: '',
-		publishedYear: '',
+        publishedYear: '',
         description: '',
         cover: match.cover || '',
         genres: [],
@@ -192,9 +198,14 @@ const provider = new AudiolibrixProvider();
 // ---------------- Routes ----------------
 app.get('/search', async (req, res) => {
   const query = req.query.query;
-  if (!query) return res.status(400).json({ error: 'Query parameter is required' });
+  if (!query) {
+    console.log('Missing query parameter');
+    return res.status(400).json({ error: 'Query parameter is required' });
+  }
 
+  console.log('Received /search request for query:', query);
   const results = await provider.searchBooks(query);
+  console.log('Returning', results.length, 'results');
   res.json({ matches: results });
 });
 
