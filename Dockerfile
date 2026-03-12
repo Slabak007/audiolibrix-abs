@@ -1,10 +1,8 @@
-FROM node:20-alpine3.20 AS build
-WORKDIR /app
-COPY package.json server.js ./
-RUN npm install
-
+# Dockerfile
 FROM node:20-alpine3.20
 WORKDIR /app
-COPY --from=build /app/server.js ./
+COPY package*.json ./
+RUN npm install --production
+COPY server.js ./
 EXPOSE 3001
 CMD ["node", "server.js"]
