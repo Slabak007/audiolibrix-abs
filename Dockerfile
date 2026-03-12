@@ -1,10 +1,10 @@
-FROM node:lts-alpine AS build
+FROM node:20-alpine3.20 AS build
 WORKDIR /app
 COPY package.json server.js ./
-RUN npm install && npm run build
+RUN npm install
 
-FROM node:lts-alpine
+FROM node:20-alpine3.20
 WORKDIR /app
-COPY --from=build /app/dist/server.js ./
+COPY --from=build /app/server.js ./  # pokud nemáš dist
 EXPOSE 3001
 CMD ["node", "server.js"]
