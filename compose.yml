@@ -1,0 +1,8 @@
+---
+services:
+  audioteka-abs:
+    image: slabak007/audiolibrix-abs
+    container_name: audiolibrix-abs
+    restart: unless-stopped
+    ports:
+      - "3001:3001"
