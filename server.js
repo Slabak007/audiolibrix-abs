@@ -23,7 +23,7 @@ function parseDuration(durationStr) {
 
 // ---------------- Express setup ----------------
 const app = express();
-const port = process.env.PORT || 3012;
+const port = process.env.PORT || 3001;
 
 app.use(cors());
 app.use((req, res, next) => {
@@ -213,3 +213,4 @@ app.get('/search', async (req, res) => {
 app.listen(port, () => {
   console.log(`Audiolibrix provider running on port ${port}`);
 });
+
