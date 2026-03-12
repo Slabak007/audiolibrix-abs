@@ -1,12 +1,10 @@
-FROM node:20-alpine3.20 AS build
+FROM node:lts-alpine AS build
 WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY server.js ./
-RUN npx esbuild server.js --platform=node --bundle --outfile=dist/server.js
+COPY package.json server.js ./
+RUN npm install && npm run build
 
-FROM node:20-alpine3.20
+FROM node:lts-alpine
 WORKDIR /app
 COPY --from=build /app/dist/server.js ./
-EXPOSE 3012
+EXPOSE 3001
 CMD ["node", "server.js"]
