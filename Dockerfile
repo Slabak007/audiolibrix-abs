@@ -5,6 +5,6 @@ RUN npm install
 
 FROM node:20-alpine3.20
 WORKDIR /app
-COPY --from=build /app/server.js ./  # pokud nemáš dist
+COPY --from=build /app/server.js ./
 EXPOSE 3001
 CMD ["node", "server.js"]
