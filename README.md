@@ -8,7 +8,8 @@ Custom **Audiobookshelf Metadata Provider** that retrieves audiobook metadata fr
 
 Supports Czech audiobooks and automatically fetches metadata for your library.
 
----
+<a href="https://www.buymeacoffee.com/slabak007" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+
 
 # Features
 
@@ -26,7 +27,6 @@ The provider fetches metadata from Audiolibrix including:
 - Language
 - Description
 
----
 
 # Screenshots
 
@@ -42,7 +42,6 @@ The provider fetches metadata from Audiolibrix including:
 
 ![Data](images/data2.jpg)
 
----
 
 # Installation
 
@@ -53,7 +52,6 @@ You must have installed:
 - Docker
 - Docker Compose
 
----
 
 # Setup
 
