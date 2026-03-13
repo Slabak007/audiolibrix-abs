@@ -93,7 +93,7 @@ docker compose down
 ### View logs
 
 ```
-docker-compose logs -f
+docker compose logs -f
 ```
 
 ## Using the provider in Audiobookshelf
