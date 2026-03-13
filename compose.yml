@@ -1,6 +1,6 @@
 ---
 services:
-  audioteka-abs:
+  audiolibrix-abs:
     image: slabak007/audiolibrix-abs
     container_name: audiolibrix-abs
     restart: unless-stopped
