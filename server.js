@@ -57,7 +57,7 @@ class AudiolibrixProvider {
       const $ = cheerio.load(response.data);
       const matches = [];
 
-      $('.alx-audiobook-list-item').slice(0, 30).each((i, el) => {
+      $('.alx-audiobook-list-item').slice(0, 15).each((i, el) => {
         const $el = $(el);
         const title = $el.find('h2 a').attr('data-book-name');
         const url = this.baseUrl + $el.find('h2 a').attr('href');
