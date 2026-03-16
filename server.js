@@ -310,7 +310,7 @@ class AudiotekaProvider {
 // ---------------- 5. Express Server ----------------
 
 const app = express();
-const port = 3030;
+const port = 3001;
 const providers = [new AudiolibrixProvider(), new AudiotekaProvider()];
 
 app.use(cors());
