@@ -4,7 +4,8 @@ const cheerio = require('cheerio');
 const cors = require('cors');
 const pLimit = require('p-limit').default;
 
-// ---------------- Utility functions ----------------
+// ---------------- Pomocné funkce ----------------
+
 function cleanCoverUrl(url) {
   if (url) return url.split('?')[0];
   return url;
@@ -21,196 +22,218 @@ function parseDuration(durationStr) {
   return 0;
 }
 
-// ---------------- Express setup ----------------
+// ---------------- Express Server ----------------
+
 const app = express();
 const port = process.env.PORT || 3001;
 
 app.use(cors());
+
+// Middleware pro autorizaci (Header: Authorization)
 app.use((req, res, next) => {
   const apiKey = req.headers['authorization'];
-  if (!apiKey) {
-    console.log('Unauthorized request:', req.method, req.url);
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  console.log('Authorized request:', req.method, req.url);
+  if (!apiKey) return res.status(401).json({ error: 'Unauthorized - Chybí Authorization Header' });
   next();
 });
 
 // ---------------- Audiolibrix Provider ----------------
+
 class AudiolibrixProvider {
   constructor() {
     this.id = 'audiolibrix';
     this.name = 'Audiolibrix';
     this.baseUrl = 'https://www.audiolibrix.com';
-    this.searchUrl = 'https://www.audiolibrix.com/cs/Search/Results';
+    this.sitemapUrl = 'https://www.audiolibrix.com/sitemap.0.xml';
+    this.bookUrlPrefix = 'https://www.audiolibrix.com/cs/Directory/Book/';
+    this.cachedLinks = [];
+    this.isRefreshing = false;
   }
 
-  async searchBooks(query) {
-    console.log('Starting search for query:', query);
+  async refreshSitemap() {
+    if (this.isRefreshing) return;
+    this.isRefreshing = true;
     try {
-      const response = await axios.get(this.searchUrl, {
-        params: { query },
-        headers: { 'User-Agent': 'Mozilla/5.0' },
+      const response = await axios.get(this.sitemapUrl, { timeout: 30000 });
+      const $ = cheerio.load(response.data, { xmlMode: true });
+      const newLinks = [];
+      $('loc').each((i, el) => {
+        const url = $(el).text();
+        if (url.startsWith(this.bookUrlPrefix)) newLinks.push(url);
       });
-
-      console.log('Search page fetched, parsing results...');
-      const $ = cheerio.load(response.data);
-      const matches = [];
-
-      $('.alx-audiobook-list-item').slice(0, 15).each((i, el) => {
-        const $el = $(el);
-        const title = $el.find('h2 a').attr('data-book-name');
-        const url = this.baseUrl + $el.find('h2 a').attr('href');
-        const cover = cleanCoverUrl($el.find('picture img').attr('src'));
-
-        if (title && url) {
-          matches.push({ title, url, cover });
-          console.log(`Found book: ${title}`);
-        }
-      });
-
-      console.log(`Found ${matches.length} matches, fetching full metadata...`);
-      const limit = pLimit(5); // maximálně 5 současně
-      const fullMetadata = await Promise.all(
-        matches.map(m => limit(() => this.getFullMetadata(m)))
-      );
-      console.log('All metadata fetched');
-      return fullMetadata;
+      if (newLinks.length > 0) {
+        this.cachedLinks = newLinks;
+        console.log(`[${new Date().toLocaleTimeString()}] Sitemapa aktualizována: ${this.cachedLinks.length} knih.`);
+      }
     } catch (err) {
-      console.error('Search error:', err.message);
-      return [];
+      console.error('Chyba sitemapy:', err.message);
+      setTimeout(() => this.refreshSitemap(), 120000);
+    } finally {
+      this.isRefreshing = false;
     }
   }
 
+  async searchBooks(query) {
+    if (this.cachedLinks.length === 0) await this.refreshSitemap();
+
+    const romanMap = { 'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10' };
+
+    let cleanQuery = query.replace(/\s*\(\d{4}\)\s*/g, " ").trim();
+    const normalizedQuery = cleanQuery.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    
+    // OPRAVA: Ponecháváme slova od 2 znaků (najde "Akt") a číslice
+    let queryWords = normalizedQuery.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 || /^[0-9ivx]+$/.test(w));
+
+    const expandedWords = queryWords.map(word => {
+      const variants = [word];
+      if (romanMap[word]) variants.push(romanMap[word]);
+      const romanVariant = Object.keys(romanMap).find(key => romanMap[key] === word);
+      if (romanVariant) variants.push(romanVariant);
+      return variants;
+    });
+
+    const searchedNumbers = expandedWords.flat().filter(w => /^[0-9]+$/.test(w) || Object.keys(romanMap).includes(w));
+
+    let matches = this.cachedLinks
+      .filter(url => {
+        const urlLower = url.toLowerCase();
+        return expandedWords.every(variants => variants.some(v => urlLower.includes(v)));
+      })
+      .map(url => {
+        const urlLower = url.toLowerCase();
+        let score = 0;
+        const slug = urlLower.replace(this.bookUrlPrefix.toLowerCase(), "");
+        const slugParts = slug.split('-');
+
+        // 1. MASIVNÍ BONUS pro přesnou shodu (hledám "Akt", slug je "akt")
+        const querySlugFormat = normalizedQuery.replace(/\s+/g, "-");
+        if (slug === querySlugFormat) score += 2000;
+
+        // 2. BONUS pokud je slovo v URL jako samostatný dílek (odděleno pomlčkami)
+        queryWords.forEach(qw => {
+          if (slugParts.includes(qw)) score += 500;
+        });
+
+        // 3. LOGIKA PRO DÍLY SÉRIE (Husitská epopej 2)
+        const lastWordVariants = expandedWords[expandedWords.length - 1];
+        if (lastWordVariants.some(v => urlLower.endsWith("-" + v))) {
+          score += 1000;
+        }
+
+        // 4. PENALIZACE pro jiná čísla (pokud v URL končí jiné číslo, než hledáme)
+        const allPossibleNumbers = [...Object.keys(romanMap), ...Object.values(romanMap)];
+        allPossibleNumbers.forEach(n => {
+          if (urlLower.endsWith("-" + n) && !searchedNumbers.includes(n)) {
+            score -= 1500; 
+          }
+        });
+
+        score -= Math.abs(slug.length - querySlugFormat.length);
+        return { url, score };
+      });
+
+    matches.sort((a, b) => b.score - a.score);
+    matches = matches.slice(0, 15);
+
+    if (matches.length === 0) return [];
+
+    const limit = pLimit(5);
+    const results = await Promise.all(matches.map(m => limit(() => this.getFullMetadata(m))));
+    return results.filter(Boolean);
+  }
+
   async getFullMetadata(match) {
-    console.log('Fetching metadata for:', match.title);
     try {
-      const response = await axios.get(match.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const response = await axios.get(match.url, { 
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
+        timeout: 10000 
+      });
       const $ = cheerio.load(response.data);
 
-      // ---------------- Subtitle ----------------
-      const subtitle = $('p.lead.mt-3').first().text().trim();
+      const rawTitle = $('h1').first().text().trim();
+      const title = rawTitle.replace(/^(audiokniha|audioknihy|e-kniha|ekniha|e-book)\s*[:\-\|]*\s*/i, "").trim();
+      const subtitle = $('p.lead, .alx-book-subtitle, h1 + p').first().text().trim() || "";
 
-      // ---------------- Description ----------------
       let description = '';
-      $('article.alx-card-clean').each((i, el) => {
-        const header = $(el).find('h2.card-title').text().trim();
-        if (header === 'Anotace') {
-          description = $(el).find('div.card-body').html() || '';
-          description = description.trim();
+      $('article.alx-card-clean, .card').each((i, el) => {
+        const cardTitle = $(el).find('h2, .card-title').text().trim();
+        if (/Anotace|Popis/i.test(cardTitle)) {
+          description = $(el).find('.card-body, .alx-book-description').html() || '';
         }
       });
+      if (!description) description = $('.alx-book-description').html() || '';
+      description = description ? description.trim() : '';
 
-      // ---------------- Duration ----------------
-      const durationStr = $('dt:contains("Délka")').next('dd').text().trim() || '';
-      const duration = parseDuration(durationStr.replace(' h', ':00'));
+      const getList = (labels) => {
+        let items = [];
+        $('dt').each((i, el) => {
+          const text = $(el).text().trim();
+          if (labels.some(l => text.toLowerCase().includes(l.toLowerCase()))) {
+            $(el).next('dd').find('a').each((j, a) => {
+              const name = $(a).text().trim();
+              if (name && !$(a).hasClass('alx-collapse-exit') && !name.includes('...')) {
+                items.push(name);
+              }
+            });
+          }
+        });
+        return [...new Set(items)];
+      };
 
-      // ---------------- Publisher & Language ----------------
-      let publisher = $('dt:contains("Vydavatel")').next('dd').find('a').first().text().trim();
-      let publishedYear = '';
-      const publisherText = $('dt:contains("Vydavatel")').next('dd').text();
-      const yearMatch = publisherText.match(/\((\d{4})\)/);
-      if (yearMatch) publishedYear = yearMatch[1];
-      const language = $('dt:contains("Jazyk")').next('dd').text().trim();
-
-      // ---------------- Genres ----------------
-      let genres = [];
+      let seriesArray = [];
       $('dt').each((i, el) => {
-        const text = $(el).text().trim();
-        if (text === 'Žánr:' || text === 'Žánry:') {
-          genres = $(el).next('dd').find('a')
-            .map((i, el) => $(el).text().trim())
-            .get()
-            .filter(Boolean);
+        if ($(el).text().toLowerCase().includes('série')) {
+          const dd = $(el).next('dd');
+          const fullText = dd.find('a span, a').first().text().trim();
+          if (fullText) {
+            const parts = fullText.split('#');
+            seriesArray.push({
+              series: parts[0].trim(),
+              sequence: parts[1] ? parts[1].trim() : ""
+            });
+          }
         }
       });
 
-      // ---------------- Series ----------------
-      const series = $('dt:contains("Série")').next('dd').find('a span')
-        .map((i, el) => $(el).text().trim())
-        .get()
-        .filter(Boolean);
+      const publisherEl = $('dt:contains("Vydavatel")').next('dd');
+      const yearMatch = publisherEl.text().match(/\((\d{4})\)/);
+      const durationStr = $('dt:contains("Délka")').next('dd').text().trim().replace(' h', ':00');
 
-      // ---------------- Authors ----------------
-      let authors = [];
-      $('dt').each((i, el) => {
-        const text = $(el).text().trim();
-        if (text === 'Autor:' || text === 'Autoři:') {
-          authors = $(el).next('dd').find('a')
-            .not('.d-block.small.alx-collapse-exit')
-            .map((i, el) => $(el).text().trim())
-            .get()
-            .filter(Boolean);
-        }
-      });
-
-      // ---------------- Narrators ----------------
-      let narrators = [];
-      $('dt').each((i, el) => {
-        const text = $(el).text().trim();
-        if (text === 'Interpret:' || text === 'Interpreti:') {
-          narrators = $(el).next('dd').find('a')
-            .not('.d-block.small.alx-collapse-exit')
-            .map((i, el) => $(el).text().trim())
-            .get()
-            .filter(Boolean);
-        }
-      });
-
-      console.log(`Metadata fetched for: ${match.title}`);
       return {
-        title: match.title || '',
-        subtitle: subtitle || '',
-        author: authors,
-        narrator: narrators,
-        publisher: publisher || '',
-        publishedYear: publishedYear || '',
-        description: description || '',
-        cover: match.cover || '',
-        genres: genres,
-        series: series,
-        language: language || '',
-        duration: duration || 0,
+        title: title,
+        subtitle: subtitle,
+        author: getList(['Autor', 'Autoři']).join(', '),
+        narrator: getList(['Interpret', 'Interpreti']).join(', '),
+        publisher: publisherEl.find('a').first().text().trim() || "",
+        publishedYear: yearMatch ? yearMatch[1] : "",
+        description: description,
+        cover: cleanCoverUrl($('picture img').attr('src')) || "",
+        isbn: "",
+        asin: "",
+        genres: getList(['Žánr', 'Žánry']),
+        tags: [],
+        series: seriesArray,
+        language: $('dt:contains("Jazyk")').next('dd').text().trim() || "",
+        duration: parseDuration(durationStr)
       };
     } catch (err) {
-      console.error('Metadata fetch error for', match.title, err.message);
-      return {
-        title: match.title || '',
-        subtitle: '',
-        author: [],
-        narrator: [],
-        publisher: '',
-        publishedYear: '',
-        description: '',
-        cover: match.cover || '',
-        genres: [],
-        series: [],
-        language: '',
-        duration: 0,
-      };
+      return null;
     }
   }
 }
 
-// ---------------- Initialize provider ----------------
-const provider = new AudiolibrixProvider();
+// ---------------- Start ----------------
 
-// ---------------- Routes ----------------
+const provider = new AudiolibrixProvider();
+provider.refreshSitemap();
+setInterval(() => provider.refreshSitemap(), 24 * 60 * 60 * 1000);
+
 app.get('/search', async (req, res) => {
   const query = req.query.query;
-  if (!query) {
-    console.log('Missing query parameter');
-    return res.status(400).json({ error: 'Query parameter is required' });
-  }
-
-  console.log('Received /search request for query:', query);
+  if (!query) return res.status(400).json({ error: 'Chybí parametr query' });
   const results = await provider.searchBooks(query);
-  console.log('Returning', results.length, 'results');
   res.json({ matches: results });
 });
 
-// ---------------- Start server ----------------
 app.listen(port, () => {
-  console.log(`Audiolibrix provider running on port ${port}`);
+  console.log(`Audiolibrix Provider běží na portu ${port}`);
 });
-
