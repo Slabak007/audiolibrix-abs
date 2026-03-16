@@ -4,45 +4,119 @@ const cheerio = require('cheerio');
 const cors = require('cors');
 const pLimit = require('p-limit').default;
 
-// ---------------- Pomocné funkce ----------------
+// ---------------- 1. Helper Functions ----------------
 
-function cleanCoverUrl(url) {
-  if (url) return url.split('?')[0];
-  return url;
+const delay = ms => new Promise(res => setTimeout(res, ms));
+
+/**
+ * Normalizes and cleans image/resource URLs
+ */
+function cleanUrl(url) {
+  if (!url) return undefined;
+  if (url.startsWith('//')) url = 'https:' + url;
+  return url.split('?')[0];
 }
 
+/**
+ * Converts various duration string formats into total minutes
+ */
 function parseDuration(durationStr) {
   if (!durationStr) return 0;
-  const match = durationStr.match(/(\d+):(\d+)/);
-  if (match) {
-    const hours = parseInt(match[1], 10);
-    const minutes = parseInt(match[2], 10);
-    return hours * 60 + minutes;
+  const str = durationStr.toLowerCase().trim();
+  let totalMinutes = 0;
+
+  const timeWithColonAndH = str.match(/(\d+):(\d+)\s*h/);
+  if (timeWithColonAndH) {
+    totalMinutes += parseInt(timeWithColonAndH[1]) * 60;
+    totalMinutes += parseInt(timeWithColonAndH[2]);
+    return totalMinutes;
+  }
+
+  const hMatch = str.match(/(\d+)\s*h/);
+  const mMatch = str.match(/(\d+)\s*(m|min)/);
+  if (hMatch || mMatch) {
+    if (hMatch) totalMinutes += parseInt(hMatch[1]) * 60;
+    if (mMatch) totalMinutes += parseInt(mMatch[1]);
+    return totalMinutes;
+  }
+
+  if (str.includes(':')) {
+    const parts = str.split(':');
+    totalMinutes += parseInt(parts[0] || 0) * 60;
+    totalMinutes += parseInt(parts[1] || 0);
+    return totalMinutes;
   }
   return 0;
 }
 
-// ---------------- Express Server ----------------
+/**
+ * Removes common prefixes from titles
+ */
+function cleanTitle(title) {
+  if (!title) return "";
+  return title
+    .replace(/^(audiokniha|audioknihy|e-kniha|ekniha|e-book|ebook|kniha)/i, "")
+    .replace(/^[\s\u00A0:;\|\-\–\—]*/, "")
+    .trim();
+}
 
-const app = express();
-const port = process.env.PORT || 3001;
+// ---------------- 2. Shared Search Logic ----------------
 
-app.use(cors());
+async function advancedSearch(query, cachedLinks, bookUrlPrefix, metadataFetcher) {
+  const romanMap = { 'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10' };
+  let cleanQuery = query.replace(/\s*\(\d{4}\)\s*/g, " ").trim();
+  const normalizedQuery = cleanQuery.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  let queryWords = normalizedQuery.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 || /^[0-9ivx]+$/.test(w));
 
-// Middleware pro autorizaci (Header: Authorization)
-app.use((req, res, next) => {
-  const apiKey = req.headers['authorization'];
-  if (!apiKey) return res.status(401).json({ error: 'Unauthorized - Chybí Authorization Header' });
-  next();
-});
+  const expandedWords = queryWords.map(word => {
+    const variants = [word];
+    if (romanMap[word]) variants.push(romanMap[word]);
+    const romanVariant = Object.keys(romanMap).find(key => romanMap[key] === word);
+    if (romanVariant) variants.push(romanVariant);
+    return variants;
+  });
 
-// ---------------- Audiolibrix Provider ----------------
+  const searchedNumbers = expandedWords.flat().filter(w => /^[0-9]+$/.test(w) || Object.keys(romanMap).includes(w));
+
+  let matches = cachedLinks
+    .filter(url => {
+      const urlLower = url.toLowerCase();
+      return expandedWords.every(variants => variants.some(v => urlLower.includes(v)));
+    })
+    .map(url => {
+      const urlLower = url.toLowerCase();
+      let score = 0;
+      const slug = urlLower.replace(bookUrlPrefix.toLowerCase(), "").replace(/\/$/, "");
+      const slugParts = slug.split('-');
+      const querySlugFormat = normalizedQuery.replace(/\s+/g, "-");
+
+      if (slug === querySlugFormat) score += 2000;
+      queryWords.forEach(qw => { if (slugParts.includes(qw)) score += 500; });
+      const lastWordVariants = expandedWords[expandedWords.length - 1];
+      if (lastWordVariants.some(v => urlLower.endsWith("-" + v))) score += 1000;
+
+      const allPossibleNumbers = [...Object.keys(romanMap), ...Object.values(romanMap)];
+      allPossibleNumbers.forEach(n => {
+        if (urlLower.endsWith("-" + n) && !searchedNumbers.includes(n)) score -= 1500;
+      });
+
+      score -= Math.abs(slug.length - querySlugFormat.length);
+      return { url, score };
+    });
+
+  matches.sort((a, b) => b.score - a.score);
+  const topMatches = matches.slice(0, 15);
+
+  const limit = pLimit(5);
+  return await Promise.all(topMatches.map(m => limit(() => metadataFetcher(m))));
+}
+
+// ---------------- 3. Audiolibrix Provider ----------------
 
 class AudiolibrixProvider {
   constructor() {
     this.id = 'audiolibrix';
     this.name = 'Audiolibrix';
-    this.baseUrl = 'https://www.audiolibrix.com';
     this.sitemapUrl = 'https://www.audiolibrix.com/sitemap.0.xml';
     this.bookUrlPrefix = 'https://www.audiolibrix.com/cs/Directory/Book/';
     this.cachedLinks = [];
@@ -55,119 +129,32 @@ class AudiolibrixProvider {
     try {
       const response = await axios.get(this.sitemapUrl, { timeout: 30000 });
       const $ = cheerio.load(response.data, { xmlMode: true });
-      const newLinks = [];
+      let links = [];
       $('loc').each((i, el) => {
-        const url = $(el).text();
-        if (url.startsWith(this.bookUrlPrefix)) newLinks.push(url);
+        const url = cheerio.load(el).text();
+        if (url.startsWith(this.bookUrlPrefix)) links.push(url);
       });
-      if (newLinks.length > 0) {
-        this.cachedLinks = newLinks;
-        console.log(`[${new Date().toLocaleTimeString()}] Sitemapa aktualizována: ${this.cachedLinks.length} knih.`);
-      }
-    } catch (err) {
-      console.error('Chyba sitemapy:', err.message);
-      setTimeout(() => this.refreshSitemap(), 120000);
-    } finally {
-      this.isRefreshing = false;
+      this.cachedLinks = links;
+      console.log(`[Audiolibrix] Sitemap indexed successfully: ${this.cachedLinks.length} books found.`);
+    } catch (e) { 
+      console.error('[Audiolibrix] Sitemap indexing failed:', e.message); 
+    } finally { 
+      this.isRefreshing = false; 
     }
   }
 
-  async searchBooks(query) {
-    if (this.cachedLinks.length === 0) await this.refreshSitemap();
-
-    const romanMap = { 'i': '1', 'ii': '2', 'iii': '3', 'iv': '4', 'v': '5', 'vi': '6', 'vii': '7', 'viii': '8', 'ix': '9', 'x': '10' };
-
-    let cleanQuery = query.replace(/\s*\(\d{4}\)\s*/g, " ").trim();
-    const normalizedQuery = cleanQuery.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-    
-    // OPRAVA: Ponecháváme slova od 2 znaků (najde "Akt") a číslice
-    let queryWords = normalizedQuery.replace(/[^a-z0-9\s]/g, ' ').split(/\s+/).filter(w => w.length >= 2 || /^[0-9ivx]+$/.test(w));
-
-    const expandedWords = queryWords.map(word => {
-      const variants = [word];
-      if (romanMap[word]) variants.push(romanMap[word]);
-      const romanVariant = Object.keys(romanMap).find(key => romanMap[key] === word);
-      if (romanVariant) variants.push(romanVariant);
-      return variants;
-    });
-
-    const searchedNumbers = expandedWords.flat().filter(w => /^[0-9]+$/.test(w) || Object.keys(romanMap).includes(w));
-
-    let matches = this.cachedLinks
-      .filter(url => {
-        const urlLower = url.toLowerCase();
-        return expandedWords.every(variants => variants.some(v => urlLower.includes(v)));
-      })
-      .map(url => {
-        const urlLower = url.toLowerCase();
-        let score = 0;
-        const slug = urlLower.replace(this.bookUrlPrefix.toLowerCase(), "");
-        const slugParts = slug.split('-');
-
-        // 1. MASIVNÍ BONUS pro přesnou shodu (hledám "Akt", slug je "akt")
-        const querySlugFormat = normalizedQuery.replace(/\s+/g, "-");
-        if (slug === querySlugFormat) score += 2000;
-
-        // 2. BONUS pokud je slovo v URL jako samostatný dílek (odděleno pomlčkami)
-        queryWords.forEach(qw => {
-          if (slugParts.includes(qw)) score += 500;
-        });
-
-        // 3. LOGIKA PRO DÍLY SÉRIE (Husitská epopej 2)
-        const lastWordVariants = expandedWords[expandedWords.length - 1];
-        if (lastWordVariants.some(v => urlLower.endsWith("-" + v))) {
-          score += 1000;
-        }
-
-        // 4. PENALIZACE pro jiná čísla (pokud v URL končí jiné číslo, než hledáme)
-        const allPossibleNumbers = [...Object.keys(romanMap), ...Object.values(romanMap)];
-        allPossibleNumbers.forEach(n => {
-          if (urlLower.endsWith("-" + n) && !searchedNumbers.includes(n)) {
-            score -= 1500; 
-          }
-        });
-
-        score -= Math.abs(slug.length - querySlugFormat.length);
-        return { url, score };
-      });
-
-    matches.sort((a, b) => b.score - a.score);
-    matches = matches.slice(0, 15);
-
-    if (matches.length === 0) return [];
-
-    const limit = pLimit(5);
-    const results = await Promise.all(matches.map(m => limit(() => this.getFullMetadata(m))));
-    return results.filter(Boolean);
-  }
-
-  async getFullMetadata(match) {
+  async fetchMetadata(match) {
     try {
-      const response = await axios.get(match.url, { 
-        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' },
-        timeout: 10000 
-      });
-      const $ = cheerio.load(response.data);
+      const res = await axios.get(match.url, { timeout: 10000 });
+      const $ = cheerio.load(res.data);
 
       const rawTitle = $('h1').first().text().trim();
-      const title = rawTitle.replace(/^(audiokniha|audioknihy|e-kniha|ekniha|e-book)\s*[:\-\|]*\s*/i, "").trim();
-      const subtitle = $('p.lead, .alx-book-subtitle, h1 + p').first().text().trim() || "";
-
-      let description = '';
-      $('article.alx-card-clean, .card').each((i, el) => {
-        const cardTitle = $(el).find('h2, .card-title').text().trim();
-        if (/Anotace|Popis/i.test(cardTitle)) {
-          description = $(el).find('.card-body, .alx-book-description').html() || '';
-        }
-      });
-      if (!description) description = $('.alx-book-description').html() || '';
-      description = description ? description.trim() : '';
-
+      const title = cleanTitle(rawTitle);
+      
       const getList = (labels) => {
         let items = [];
         $('dt').each((i, el) => {
-          const text = $(el).text().trim();
-          if (labels.some(l => text.toLowerCase().includes(l.toLowerCase()))) {
+          if (labels.some(l => $(el).text().toLowerCase().includes(l.toLowerCase()))) {
             $(el).next('dd').find('a').each((j, a) => {
               const name = $(a).text().trim();
               if (name && !$(a).hasClass('alx-collapse-exit') && !name.includes('...')) {
@@ -179,61 +166,208 @@ class AudiolibrixProvider {
         return [...new Set(items)];
       };
 
-      let seriesArray = [];
+      // FIXED: Using .html() to keep tags in description
+      let description = '';
+      $('article.alx-card-clean, .card').each((i, el) => {
+        const cardTitle = $(el).find('h2, .card-title').text().trim();
+        if (/Anotace|Popis/i.test(cardTitle)) {
+          description = $(el).find('.card-body, .alx-book-description').html() || '';
+        }
+      });
+      if (!description) description = $('.alx-book-description').html() || '';
+
+      const seriesArray = [];
       $('dt').each((i, el) => {
         if ($(el).text().toLowerCase().includes('série')) {
           const dd = $(el).next('dd');
           const fullText = dd.find('a span, a').first().text().trim();
           if (fullText) {
             const parts = fullText.split('#');
-            seriesArray.push({
-              series: parts[0].trim(),
-              sequence: parts[1] ? parts[1].trim() : ""
-            });
+            seriesArray.push({ series: parts[0].trim(), sequence: parts[1] ? parts[1].trim() : "" });
           }
         }
       });
 
       const publisherEl = $('dt:contains("Vydavatel")').next('dd');
       const yearMatch = publisherEl.text().match(/\((\d{4})\)/);
-      const durationStr = $('dt:contains("Délka")').next('dd').text().trim().replace(' h', ':00');
 
       return {
+        provider: this.name,
         title: title,
-        subtitle: subtitle,
+        subtitle: $('p.lead, .alx-book-subtitle, h1 + p').first().text().trim() || "",
         author: getList(['Autor', 'Autoři']).join(', '),
         narrator: getList(['Interpret', 'Interpreti']).join(', '),
         publisher: publisherEl.find('a').first().text().trim() || "",
         publishedYear: yearMatch ? yearMatch[1] : "",
-        description: description,
-        cover: cleanCoverUrl($('picture img').attr('src')) || "",
-        isbn: "",
-        asin: "",
+        description: description.trim(),
+        cover: cleanUrl($('picture img').attr('src')),
         genres: getList(['Žánr', 'Žánry']),
-        tags: [],
         series: seriesArray,
-        language: $('dt:contains("Jazyk")').next('dd').text().trim() || "",
-        duration: parseDuration(durationStr)
+        language: $('dt:contains("Jazyk")').next('dd').text().trim() || "Czech",
+        tags: ["Audiolibrix"],
+        duration: parseDuration($('dt:contains("Délka")').next('dd').text().trim()),
+        url: match.url
       };
-    } catch (err) {
-      return null;
-    }
+    } catch (err) { return null; }
   }
 }
 
-// ---------------- Start ----------------
+// ---------------- 4. Audioteka Provider ----------------
 
-const provider = new AudiolibrixProvider();
-provider.refreshSitemap();
-setInterval(() => provider.refreshSitemap(), 24 * 60 * 60 * 1000);
+class AudiotekaProvider {
+  constructor() {
+    this.id = 'audioteka';
+    this.name = 'Audioteka';
+    this.indexSitemapUrl = 'https://audioteka.com/cz/sitemap/audiobooks.xml';
+    this.bookUrlPrefix = 'https://audioteka.com/cz/audiokniha/';
+    this.cachedLinks = [];
+    this.isRefreshing = false;
+  }
+
+  async refreshSitemap() {
+    if (this.isRefreshing) return;
+    this.isRefreshing = true;
+    try {
+      const response = await axios.get(this.indexSitemapUrl, { timeout: 30000 });
+      const $index = cheerio.load(response.data, { xmlMode: true });
+      const sitemapUrls = [];
+      $index('loc').each((i, el) => sitemapUrls.push(cheerio.load(el).text()));
+
+      const allLinks = [];
+      for (const url of sitemapUrls) {
+        try {
+          await delay(400); 
+          const res = await axios.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
+          const $sub = cheerio.load(res.data, { xmlMode: true });
+          $sub('loc').each((i, el) => {
+            const link = cheerio.load(el).text();
+            if (link.includes('/audiokniha/')) allLinks.push(link);
+          });
+        } catch (e) { }
+      }
+      this.cachedLinks = [...new Set(allLinks)];
+      console.log(`[Audioteka] Sitemap indexed successfully: ${this.cachedLinks.length} books found.`);
+    } catch (err) { 
+      console.error('[Audioteka] Indexing failed:', err.message); 
+    } finally { 
+      this.isRefreshing = false; 
+    }
+  }
+
+  async fetchMetadata(match) {
+    try {
+      const res = await axios.get(match.url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+      const $ = cheerio.load(res.data);
+      
+      const getMeta = (lbls) => {
+        let r = [];
+        $('dt').each((i, el) => {
+          if (lbls.some(l => $(el).text().toLowerCase().includes(l.toLowerCase()))) {
+            const dd = $(el).next('dd');
+            dd.find('li, a').each((_, it) => r.push($(it).text().trim()));
+            if (r.length === 0) r.push(dd.text().trim());
+          }
+        });
+        return [...new Set(r)].filter(Boolean);
+      };
+
+      let authors = [];
+      $('a.product-top_author__BPJgI').each((i, el) => {
+        authors.push($(el).text().trim());
+      });
+      if (authors.length === 0) authors = getMeta(['Autor']);
+
+      const seriesRaw = getMeta(['Série']);
+      const seriesInfo = seriesRaw.map(s => {
+        const parts = s.split(/\s+#/);
+        return { series: parts[0].trim(), sequence: parts[1] ? parts[1].trim() : "" };
+      });
+
+      // FIXED: Using .html() to keep tags in description
+      const descHtml = $('.description_description__6gcfq').html() || $('meta[property="og:description"]').attr('content');
+
+      return {
+        provider: this.name,
+        title: cleanTitle($('h1').first().text()),
+        subtitle: "",
+        author: authors.join(', '),
+        narrator: getMeta(['Interpret', 'Účinkující']).join(', '),
+        publisher: getMeta(['Vydavatel'])[0] || "",
+        publishedYear: getMeta(['Rok vydání'])[0]?.match(/\d{4}/)?.[0] || "",
+        description: descHtml ? descHtml.trim() : "",
+        cover: cleanUrl($('meta[property="og:image"]').attr('content')),
+        genres: getMeta(['Kategorie', 'Žánr']),
+        series: seriesInfo,
+        language: getMeta(['Jazyk'])[0] || "Czech",
+        tags: ["Audioteka"],
+        duration: parseDuration(getMeta(['Délka'])[0]),
+        url: match.url
+      };
+    } catch (e) { return null; }
+  }
+}
+
+// ---------------- 5. Express Server ----------------
+
+const app = express();
+const port = 3030;
+const providers = [new AudiolibrixProvider(), new AudiotekaProvider()];
+
+app.use(cors());
+
+app.use((req, res, next) => {
+  if (!req.headers['authorization']) {
+    return res.status(401).json({ error: 'Unauthorized: Missing authorization header' });
+  }
+  next();
+});
+
+async function refreshAllSitemaps() {
+  console.log(`[${new Date().toISOString()}] Starting scheduled sitemap update...`);
+  for (const p of providers) {
+    await p.refreshSitemap();
+  }
+  console.log(`[${new Date().toISOString()}] Sitemap update completed.`);
+}
 
 app.get('/search', async (req, res) => {
   const query = req.query.query;
-  if (!query) return res.status(400).json({ error: 'Chybí parametr query' });
-  const results = await provider.searchBooks(query);
-  res.json({ matches: results });
+  if (!query) return res.status(400).json({ error: 'Missing search query' });
+
+  if (query.startsWith('http')) {
+    const provider = providers.find(p => query.includes(p.id));
+    if (provider) {
+      const metadata = await provider.fetchMetadata({ url: query });
+      return res.json({ matches: metadata ? [metadata] : [] });
+    }
+    return res.json({ matches: [] });
+  }
+
+  const searchPromises = providers.map(p => 
+    advancedSearch(query, p.cachedLinks, p.bookUrlPrefix, (m) => p.fetchMetadata(m))
+  );
+
+  const results = await Promise.all(searchPromises);
+  res.json({ matches: results.flat().filter(Boolean) });
 });
 
-app.listen(port, () => {
-  console.log(`Audiolibrix Provider běží na portu ${port}`);
+app.get('/lookup', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: 'Missing URL parameter' });
+  
+  const provider = providers.find(p => url.includes(p.id));
+  if (!provider) return res.status(404).json({ error: 'Provider not found for the given URL' });
+  
+  const metadata = await provider.fetchMetadata({ url: url });
+  if (!metadata) return res.status(404).json({ error: 'Metadata not found' });
+  
+  res.json(metadata);
+});
+
+app.listen(port, async () => {
+  console.log(`Server successfully started and listening on port ${port}`);
+  await refreshAllSitemaps();
+  setInterval(async () => {
+    await refreshAllSitemaps();
+  }, 24 * 60 * 60 * 1000);
 });
