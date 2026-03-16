@@ -4,7 +4,7 @@
 ![Docker Image Size](https://img.shields.io/docker/image-size/slabak007/audiolibrix-abs/latest)
 ![License](https://img.shields.io/github/license/Slabak007/audiolibrix-abs)
 
-Custom **[Audiobookshelf](https://www.audiobookshelf.org/) Metadata Provider** that retrieves audiobook metadata from **Audiolibrix.com**.
+Custom **[Audiobookshelf](https://www.audiobookshelf.org/) Metadata Provider** that retrieves audiobook metadata from **Audiolibrix.com** and **Audioteka.com** in one.
 
 Supports Czech audiobooks and automatically fetches metadata for your library.
 
@@ -23,6 +23,17 @@ The provider fetches metadata from Audiolibrix including:
 - Publisher
 - Published year
 - Series
+- Genres
+- Language
+- Description
+
+The provider fetches metadata from Audioteka including:
+
+- Cover image
+- Title
+- Author(s)
+- Narrator(s)
+- Publisher
 - Genres
 - Language
 - Description
