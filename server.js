@@ -150,6 +150,7 @@ class AudiolibrixProvider {
 
       const rawTitle = $('h1').first().text().trim();
       const title = cleanTitle(rawTitle);
+      const coverUrl = $('.alx-audiobook-detail img').attr('src');
       
       const getList = (labels) => {
         let items = [];
@@ -200,7 +201,7 @@ class AudiolibrixProvider {
         publisher: publisherEl.find('a').first().text().trim() || "",
         publishedYear: yearMatch ? yearMatch[1] : "",
         description: description.trim(),
-        cover: cleanUrl($('picture img').attr('src')),
+        cover: cleanUrl(coverUrl),
         genres: getList(['Žánr', 'Žánry']),
         series: seriesArray,
         language: $('dt:contains("Jazyk")').next('dd').text().trim() || "Czech",
