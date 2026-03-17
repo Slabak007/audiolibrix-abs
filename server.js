@@ -255,57 +255,91 @@ class AudiotekaProvider {
     }
   }
 
-  async fetchMetadata(match) {
-    try {
-      const res = await axios.get(match.url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } });
-      const $ = cheerio.load(res.data);
-      
-      const getMeta = (lbls) => {
-        let r = [];
-        $('dt').each((i, el) => {
-          if (lbls.some(l => $(el).text().toLowerCase().includes(l.toLowerCase()))) {
-            const dd = $(el).next('dd');
-            dd.find('li, a').each((_, it) => r.push($(it).text().trim()));
-            if (r.length === 0) r.push(dd.text().trim());
-          }
-        });
-        return [...new Set(r)].filter(Boolean);
-      };
+async fetchMetadata(match) {
+  try {
+    const res = await axios.get(match.url, { timeout: 10000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+    const html = res.data;
+    const $ = cheerio.load(html);
 
-      let authors = [];
-      $('a.product-top_author__BPJgI').each((i, el) => {
-        authors.push($(el).text().trim());
+    // --- METADATA EXTRACTION LOGIC ---
+    let publishedYear = "";
+    
+    // Pattern to find the internal audiobook data payload
+    const detailMatch = html.match(/\\"audiobook\\":(?<payload>\{\\"name\\":.*?\})\s*,\\"currency\\":/);
+    
+    if (detailMatch && detailMatch.groups.payload) {
+      try {
+        // Decode escaped quotes to get a valid JSON string
+        const cleanJsonString = detailMatch.groups.payload.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        const audiobookData = JSON.parse(cleanJsonString);
+        
+        // Priority: External Release -> Digital Release -> System Creation
+        const rawDate = audiobookData.external_published_at || 
+                        audiobookData.published_at || 
+                        audiobookData.created_at;
+        
+        if (rawDate) {
+          const yearMatch = rawDate.match(/\d{4}/);
+          if (yearMatch) publishedYear = yearMatch[0];
+        }
+      } catch (e) {
+        console.error("Error parsing Audioteka JSON payload:", e.message);
+      }
+    }
+
+    // Helper to get metadata from the definition list (labels in Czech, values to English-friendly structure)
+    const getMetadata = (labels) => {
+      let results = [];
+      $('dt').each((i, el) => {
+        const text = $(el).text().toLowerCase();
+        if (labels.some(label => text.includes(label.toLowerCase()))) {
+          const dd = $(el).next('dd');
+          dd.find('li, a').each((_, item) => results.push($(item).text().trim()));
+          if (results.length === 0) results.push(dd.text().trim());
+        }
       });
-      if (authors.length === 0) authors = getMeta(['Autor']);
+      return [...new Set(results)].filter(Boolean);
+    };
 
-      const seriesRaw = getMeta(['Série']);
-      const seriesInfo = seriesRaw.map(s => {
-        const parts = s.split(/\s+#/);
-        return { series: parts[0].trim(), sequence: parts[1] ? parts[1].trim() : "" };
-      });
+    let authors = [];
+    $('a.product-top_author__BPJgI').each((i, el) => {
+      authors.push($(el).text().trim());
+    });
+    // Fallback to table if author link is missing
+    if (authors.length === 0) authors = getMetadata(['Autor']);
 
-      // FIXED: Using .html() to keep tags in description
-      const descHtml = $('.description_description__6gcfq').html() || $('meta[property="og:description"]').attr('content');
-
-      return {
-        provider: this.name,
-        title: cleanTitle($('h1').first().text()),
-        subtitle: "",
-        author: authors.join(', '),
-        narrator: getMeta(['Interpret', 'Účinkující']).join(', '),
-        publisher: getMeta(['Vydavatel'])[0] || "",
-        publishedYear: getMeta(['Rok vydání'])[0]?.match(/\d{4}/)?.[0] || "",
-        description: descHtml ? descHtml.trim() : "",
-        cover: cleanUrl($('meta[property="og:image"]').attr('content')),
-        genres: getMeta(['Kategorie', 'Žánr']),
-        series: seriesInfo,
-        language: getMeta(['Jazyk'])[0] || "Czech",
-        tags: ["Audioteka"],
-        duration: parseDuration(getMeta(['Délka'])[0]),
-        url: match.url
+    const seriesRaw = getMetadata(['Série']);
+    const seriesInfo = seriesRaw.map(s => {
+      const parts = s.split(/\s+#/);
+      return { 
+        series: parts[0].trim(), 
+        sequence: parts[1] ? parts[1].trim() : "" 
       };
-    } catch (e) { return null; }
+    });
+
+    const descriptionHtml = $('.description_description__6gcfq').html() || $('meta[name="description"]').attr('content');
+
+    return {
+      provider: this.name,
+      title: cleanTitle($('h1').first().text()),
+      subtitle: "",
+      author: authors.join(', '),
+      narrator: getMetadata(['Interpret', 'Účinkující']).join(', '),
+      publisher: getMetadata(['Vydavatel'])[0] || "",
+      publishedYear: publishedYear || getMetadata(['Rok vydání'])[0]?.match(/\d{4}/)?.[0] || "",
+      description: descriptionHtml ? descriptionHtml.trim() : "",
+      cover: cleanUrl($('meta[property="og:image"]').attr('content')),
+      genres: getMetadata(['Kategorie', 'Žánr']),
+      series: seriesInfo,
+      language: getMetadata(['Jazyk'])[0] || "Czech",
+      tags: ["Audioteka"],
+      duration: parseDuration(getMetadata(['Délka'])[0]),
+      url: match.url
+    };
+  } catch (err) { 
+    return null; 
   }
+}
 }
 
 // ---------------- 5. Express Server ----------------
@@ -315,6 +349,12 @@ const port = 3001;
 const providers = [new AudiolibrixProvider(), new AudiotekaProvider()];
 
 app.use(cors());
+
+// Log every incoming request to the console
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.originalUrl}`);
+  next();
+});
 
 app.use((req, res, next) => {
   if (!req.headers['authorization']) {
