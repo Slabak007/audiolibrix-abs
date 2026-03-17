@@ -333,8 +333,11 @@ async function refreshAllSitemaps() {
 
 app.get('/search', async (req, res) => {
   const query = req.query.query;
+  const authorQuery = req.query.author; // Get author from the request query
+
   if (!query) return res.status(400).json({ error: 'Missing search query' });
 
+  // 1. Logic for direct URLs remains the same
   if (query.startsWith('http')) {
     const provider = providers.find(p => query.includes(p.id));
     if (provider) {
@@ -344,12 +347,39 @@ app.get('/search', async (req, res) => {
     return res.json({ matches: [] });
   }
 
+  // 2. Perform basic search across all providers
   const searchPromises = providers.map(p => 
     advancedSearch(query, p.cachedLinks, p.bookUrlPrefix, (m) => p.fetchMetadata(m))
   );
 
   const results = await Promise.all(searchPromises);
-  res.json({ matches: results.flat().filter(Boolean) });
+  let allMatches = results.flat().filter(Boolean);
+
+  // 3. --- SORTING LOGIC BY AUTHOR ---
+  if (authorQuery && allMatches.length > 0) {
+    // Normalize target author (lowercase, remove diacritics)
+    const normalizedTarget = authorQuery.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+    allMatches.sort((a, b) => {
+      // Normalize authors in found metadata
+      const authA = (a.author || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+      const authB = (b.author || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
+      // Check if the name in the data matches the query
+      const matchA = authA.includes(normalizedTarget) || normalizedTarget.includes(authA);
+      const matchB = authB.includes(normalizedTarget) || normalizedTarget.includes(authB);
+
+      // If A matches the author and B does not, move A up (-1)
+      if (matchA && !matchB) return -1;
+      // If B matches the author and A does not, move B up (1)
+      if (!matchA && matchB) return 1;
+
+      // If both match or both don't match, keep original order from advancedSearch
+      return 0;
+    });
+  }
+
+  res.json({ matches: allMatches });
 });
 
 app.get('/lookup', async (req, res) => {
