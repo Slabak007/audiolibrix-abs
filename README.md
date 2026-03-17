@@ -34,6 +34,7 @@ The provider fetches metadata from Audioteka including:
 - Author(s)
 - Narrator(s)
 - Publisher
+- Published year
 - Genres
 - Language
 - Description
